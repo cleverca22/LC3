@@ -19,6 +19,9 @@ executable LC3
     base,
     bytestring,
     lens,
+    formatting,
+    text,
+    binary,
     hspec,
     mtl,
     vector

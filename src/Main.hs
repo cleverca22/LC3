@@ -10,6 +10,8 @@
 {-# LANGUAGE BinaryLiterals             #-}
 {-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeFamilies               #-}
+{-# LANGUAGE OverloadedStrings          #-}
+
 module Main where
 
 import           Control.Lens
@@ -19,9 +21,11 @@ import           Data.Bits.Lens
 import           Data.Bool
 import           Data.ByteString     (ByteString)
 import qualified Data.ByteString     as B
+import qualified Data.ByteString.Lazy as LBS
 import           Data.Char
 import           Data.List
 import           Data.Proxy
+import qualified Data.Text as T
 import           Data.Vector         (Vector)
 import qualified Data.Vector         as V
 import           Data.Word
@@ -30,6 +34,8 @@ import           System.Environment
 import           System.Exit
 import           System.IO
 import           Test.Hspec
+import           Formatting
+import           Data.Binary.Get
 
 newtype Memory (size :: Nat)
   = Memory { _mem :: Vector Word16 }
@@ -126,6 +132,16 @@ data OpCode
   | TRAP -- /* execute trap */
   deriving (Eq, Ord, Show, Enum)
 
+data OpCode2
+  = Lea { opReg :: R, offset :: Word16}
+  | Trap { trapCmd :: Word16 }
+  | Ldr { ldrR0 :: R, ldrR1 :: R, ldrOffset :: Word16 }
+  | AddImm { addImmR0 :: R, addImmR1 :: R, addImm :: Word16 }
+  | Add { addR0 :: R, addR1 :: R, addR2 :: R }
+  | Ldi { ldiR0 :: R, ldiOffset :: Word16 }
+  | Other
+  deriving (Show)
+
 type Addr = Word16
 type Val  = Word16
 
@@ -137,12 +153,13 @@ getKey = getChar
 
 checkKey :: IO (Maybe Word16)
 checkKey = do
-  result <- B.hGetNonBlocking stdin 2
-  pure $ case result of
-    x | B.null x -> Nothing
+  result <- B.hGetNonBlocking stdin 1
+  case result of
+    x | B.null x -> pure Nothing
       | otherwise -> do
-          let [l,r] = B.unpack x
-          Just $ foldl' (go (l,r)) 0x0 [0..15]
+          let [l] = B.unpack x
+          print x
+          pure $ Just $ fromIntegral l
         where
           go (l,r) x n
             | n < 8 = setBit x $ popCount (testBit r n)
@@ -157,6 +174,7 @@ memRead (fromIntegral -> addr)
         maybeKey <- liftIO checkKey
         case maybeKey of
           Just key -> do
+            liftIO $ print maybeKey
             mem mrKBSR .= 1 `shiftL` 15
             mem mrKBDR .= key
           Nothing ->
@@ -173,6 +191,7 @@ neg = 4
 
 main :: IO ()
 main = do
+  hSetBuffering stdin NoBuffering
   heap <- readImageFile
   let machine = Machine registers heap Running
   finished <- runRoutine machine routine
@@ -183,10 +202,24 @@ readImageFile = do
   args <- getArgs
   case args of
     fileName : _ -> do
-      (swap16 . fromIntegral -> origin) : (map (swap16 . fromIntegral) -> bytes)
-        <- B.unpack <$> B.readFile fileName
-      let pad = V.replicate (fromIntegral origin - 1) (0x0 :: Word16)
-          mid = V.fromList bytes
+      rawbs <- LBS.readFile fileName
+      let
+        parser :: Get (Word16, [Word16])
+        parser = do
+          origin <- getWord16be
+          let
+            go :: [Word16] -> Get (Word16,[Word16])
+            go result = do
+              empty <- isEmpty
+              if empty then
+                pure (origin, result)
+              else do
+                word <- getWord16be
+                go (result <> [word])
+          go []
+      let (origin, words) = runGet parser rawbs
+      let pad = V.replicate (fromIntegral origin) (0x0 :: Word16)
+          mid = V.fromList words
           end = V.replicate (65536 - (V.length pad + V.length mid)) (0x0 :: Word16)
       -- mapM_ print (fmap getOp mid)
       pure $ Memory (pad <> mid <> end)
@@ -202,8 +235,7 @@ type Routine = StateT Machine IO
 signExtend :: Word16 -> Int -> Word16
 signExtend x bitCount
   -- shiftL or shiftR? that is the question...
-  | x `shiftL` (bitCount - 1) .&. 1 == 1
-  = x .|. (0xFFFF `shiftL` bitCount)
+  | x `shiftR` (bitCount - 1) .&. 1 == 1 = x .|. (0xFFFF `shiftL` bitCount)
   | otherwise = x
 
 updateFlags :: R -> Routine ()
@@ -232,12 +264,66 @@ routine = do
   fix $ \go -> do
     s <- use status
     unless (s == Halt) $ do
-      reg PC += 1
       loop >> go
+
+parseInstr :: Word16 -> OpCode2
+parseInstr instr = do
+  let immMode = instr ^. bitAt 5
+  case getOp instr of
+    ADD -> do
+      let
+        r0 = toE $ (instr `shiftR` 9) .&. 0x7
+        r1 = toE $ (instr `shiftR` 6) .&. 0x7
+      if immMode then do
+        let
+          imm5 = signExtend (instr .&. 0x1F) 5
+        AddImm r0 r1 imm5
+      else do
+        let
+          r2 = toE (instr .&. 0x7)
+        Add r0 r1 r2
+    LEA -> do
+      let
+        r0 :: R
+        r0 = toE $ (instr `shiftR` 9) .&. 0x7
+        offset = signExtend (instr .&. 0x1ff) 9
+      Lea r0 offset
+    TRAP -> Trap (instr .&. 0xFF)
+    LDR -> do
+      let
+        r0 = toE $ (instr `shiftR` 9) .&. 0x7
+        r1 = toE $ (instr `shiftR` 6) .&. 0x7
+        offset = signExtend (instr .&. 0x3F) 6
+      Ldr r0 r1 offset
+    LDI -> do
+      let
+        dr = toE $ (instr `shiftR` 9) .&. 0x7
+        pcOffset = signExtend (instr .&. 0x1ff) 9
+      Ldi dr pcOffset
+    _ -> Other
+
+dumpRegs :: Routine ()
+dumpRegs = do
+  pc <- use $ reg PC
+  instr <- memRead pc
+  r0 <- use $ reg R0
+  r1 <- use $ reg R1
+  r6 <- use $ reg R6
+  let
+    immMode = instr ^. bitAt 5
+    parsed = parseInstr instr
+    op = getOp instr
+    fmt :: Format T.Text (Word16 -> Word16 -> Bool -> OpCode -> Word16 -> Word16 -> Word16 -> OpCode2 -> T.Text)
+    fmt = "PC: 0x" % hex % " Instr: 0x" % hex % " Imm: " % shown % " OP: " % shown % " R0: 0x" % hex % " R1: 0x" % hex % " R6: 0x" % hex % " OP: " % shown
+  liftIO $ do
+    hPutStrLn stderr $ T.unpack $ sformat fmt pc instr immMode op r0 r1 r6 parsed
+    hFlush stderr
 
 loop :: Routine ()
 loop = do
+  dumpRegs
   instr <- memRead =<< use (reg PC)
+  reg PC += 1
   let immMode = instr ^. bitAt 5
   case getOp instr of
     ADD -> do
@@ -259,8 +345,8 @@ loop = do
           pcOffset = signExtend (instr .&. 0x1ff) 9
       -- reg[r0] = mem_read(mem_read(reg[R_PC] + pc_offset))
       pcVal <- use (reg PC)
-      r <- use . mem . fromIntegral =<< do
-        use $ mem (fromIntegral (pcVal + pcOffset))
+      addr <- use $ mem (fromIntegral (pcVal + pcOffset))
+      r <- memRead addr
       reg dr .= r
       updateFlags dr
     RTI ->
@@ -321,10 +407,12 @@ loop = do
       reg r0 .= val
       updateFlags r0
     LEA -> do
-      let r0 = toE $ (instr `shiftR` 9) .&. 0x7
+      let
+          r0 :: R
+          r0 = toE $ (instr `shiftR` 9) .&. 0x7
           offset = signExtend (instr .&. 0x1ff) 9
       pc <- use (reg PC)
-      val <- memRead (pc + offset)
+      let val = (pc + offset)
       reg r0 .= val
     ST -> do
       let r0 = toE $ (instr `shiftR` 9) .&. 0x7
@@ -349,16 +437,23 @@ loop = do
       case instr .&. 0xFF of
         t | trapGetc == t -> do
               r <- fromIntegral . ord <$> liftIO getChar
+              liftIO $ hPutStrLn stderr $ "trapgetc read: " <> (show r)
               reg R0 .= r
           | trapPuts == t -> do
               v <- use (reg R0)
-              let loop x = do
+              let
+                loop 100 = liftIO exitFailure
+                loop x = do
                     val <- memRead x
-                    unless (val == 0x0000) $ do
+                    liftIO $ hPutStrLn stderr $ "reading " <> (show x) <> " " <> (show val)
+                    if val == 0x0000 then
+                      pure ()
+                    else do
                       let c = chr (fromIntegral val)
                       liftIO (putChar c)
-                    loop (x+1)
+                      loop (x+1)
               loop v
+              liftIO $ hFlush stdout
           | trapPutsp == t -> do
               v <- use (reg R0)
               let loop x = do
@@ -383,7 +478,6 @@ loop = do
                 print (getOp instr)
                 print instr
                 exitFailure
-
 
 pcStart :: Int
 pcStart = fromIntegral 0x3000

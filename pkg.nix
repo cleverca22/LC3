@@ -1,4 +1,5 @@
-{ mkDerivation, base, bytestring, hspec, lens, mtl, stdenv, vector
+{ mkDerivation, base, binary, bytestring, formatting, hspec, lens
+, mtl, stdenv, text, vector
 }:
 mkDerivation {
   pname = "LC3";
@@ -7,7 +8,7 @@ mkDerivation {
   isLibrary = false;
   isExecutable = true;
   executableHaskellDepends = [
-    base bytestring hspec lens mtl vector
+    base binary bytestring formatting hspec lens mtl text vector
   ];
   description = "LC-3 virtual machine";
   license = stdenv.lib.licenses.bsd3;
